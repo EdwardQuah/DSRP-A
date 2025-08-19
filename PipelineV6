@@ -1,0 +1,352 @@
+### ! Note that this is a script, and if just copied and pasted, will initiate the download sequence. Please comment out the last two lines to prevent this. 
+### PipelineV6 (STRICT QUOTA, DURATION-GATED, CLEAN FOLDERS, PAGED SEARCH)
+### CC search via YouTube Data API (requests, no googleapiclient)
+### Download via yt-dlp (progressive MP4 preferred; retries, pacing, backoff)
+### Strict per-genre quotas: keeps paging & trying until each genre is filled
+### Enforces 60–180s duration via yt-dlp match_filter
+### Numbered batch folders; videos and sidecars separated
+### Suppresses SABR warning noise in logs
+
+
+### Setup and load libraries
+import os
+import time
+import random
+import logging
+from pathlib import Path
+import requests
+from yt_dlp import YoutubeDL
+from yt_dlp.utils import match_filter_func
+
+### Configuration 
+API_KEY = "AIzaSyC4t8xZGbpRqWSqOAnPpjol3SVNmusoumg" 
+
+### Genres (will have equal ratio for each genre)
+SEARCH_TERMS = [
+    "jazz instrumental",
+    "classical music",
+    "ambient music",
+    "electronic dance",
+    "pop",
+    "lo fi",
+    "hardstyle"
+]
+
+
+### Targets
+MAX_VIDEOS = 140                 
+VIDEO_DURATION_HINT = "short"    # any | short | medium | long | any
+PAGE_SIZE = 50                   # YouTube Data API max per page
+MAX_PAGES_PER_GENRE = 20         # safety cap: 50 * 20 = 1000 candidates/genre
+
+### Duration gate (toggle ON for 60–180s strictness)
+ENFORCE_DURATION = False         # set True to enforce the bounds below
+DURATION_MIN_S = 60
+DURATION_MAX_S = 300
+
+### Layout
+DOWNLOAD_ROOT = Path("downloads")
+LOG_DIR = Path("logs")
+ARCHIVE_FILE = DOWNLOAD_ROOT / "archive.txt"   # prevents download if url already in archive
+
+### Pacing/backoff 
+### This is the most important part to prevent being blocked by YouTube
+JITTER_BETWEEN_ATTEMPTS = (1.0, 3.0)  # stops randomly between attempts
+JITTER_BETWEEN_PAGES = (2.0, 5.0)     # stops randomly between page searches
+BACKOFF_AFTER_FAILS = 3               # max cap for fails before sleep
+BACKOFF_SECONDS = 30                  # sleep for 30s before restarting
+
+### Batch directory maker
+def _next_batch_index(root: Path) -> int:
+    root.mkdir(parents=True, exist_ok=True)
+    idx = 0
+    for p in root.iterdir():
+        if p.is_dir() and p.name.startswith("batch_"):
+            try:
+                idx = max(idx, int(p.name.split("batch_")[-1]))
+            except Exception:
+                pass
+    return idx + 1
+
+### Some configurations for batch file management
+### Batches in this version are saved successively and videos/metadata are separated to prevent clutter in one folder
+BATCH_ID = _next_batch_index(DOWNLOAD_ROOT)
+BATCH_DIR = DOWNLOAD_ROOT / f"batch_{BATCH_ID:04d}"
+VIDEOS_DIR = BATCH_DIR / "videos"
+META_DIR = BATCH_DIR / "meta"
+LOG_FILE = LOG_DIR / f"download_log_{BATCH_ID:04d}.txt"
+FAIL_LOG = LOG_DIR / f"failures_{BATCH_ID:04d}.txt"
+
+### Logging information for sanity check during runs
+for h in logging.root.handlers[:]:
+    logging.root.removeHandler(h)
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.FileHandler(LOG_FILE), logging.StreamHandler()],
+)
+
+### If downloads fail, log reason
+def _append_fail(url: str, reason: str, genre: str):
+    try:
+        with FAIL_LOG.open("a", encoding="utf-8") as fh:
+            fh.write(f"{genre}\t{url}\t{reason}\n")
+    except Exception:
+        pass
+
+### SABR warnings keep popping up. This is just to mute/ignore the messages and prevent clutter
+class YTDLPLogger:
+    """Route yt-dlp logs into Python logging and hide SABR noise lines."""
+    def _ok(self, msg):
+        return bool(msg) and msg.strip()
+    def debug(self, msg):
+        if self._ok(msg) and "SABR streaming" not in msg:
+            logging.debug(msg)
+    def info(self, msg):
+        if self._ok(msg) and "SABR streaming" not in msg:
+            logging.info(msg)
+    def warning(self, msg):
+        if self._ok(msg) and "SABR streaming" not in msg:
+            logging.warning(msg)
+    def error(self, msg):
+        if self._ok(msg):
+            logging.error(msg)
+
+### Helper function to initiate directory
+def initialize_directories():
+    VIDEOS_DIR.mkdir(parents=True, exist_ok=True)
+    META_DIR.mkdir(parents=True, exist_ok=True)
+    ARCHIVE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    if not ARCHIVE_FILE.exists():
+        ARCHIVE_FILE.touch()
+
+### This function generates a list of urls to try by searching one page at a time from YouTube API
+### Depends on MAX_PAGES_PER_GENRE variable.
+### Also shows log for which genre it has searched for and how many "candidates" passed the config requirements
+def search_youtube_cc_stream(api_key: str, query: str, video_duration: str = "any"):
+    """
+    Generator yielding lists of watch-URLs, one page at a time (up to MAX_PAGES_PER_GENRE).
+    """
+    assert video_duration in {"any", "short", "medium", "long"}
+    base = "https://www.googleapis.com/youtube/v3/search"
+    next_page_token = None
+    pages = 0
+
+    while pages < MAX_PAGES_PER_GENRE:
+        params = {
+            "part": "snippet",
+            "q": query,
+            "type": "video",
+            "videoLicense": "creativeCommon",
+            "videoDuration": video_duration,
+            "maxResults": PAGE_SIZE,
+            "key": api_key,
+        }
+        if next_page_token:
+            params["pageToken"] = next_page_token
+
+        r = requests.get(base, params=params, timeout=30)
+        try:
+            r.raise_for_status()
+        except Exception as e:
+            # If quota exceeded or transient error, log and stop this genre
+            try:
+                err = r.json()
+            except Exception:
+                err = {"error": str(e)}
+            logging.error(f"[search] error for '{query}': {err}")
+            break
+
+        data = r.json()
+        pages += 1
+        urls = []
+        for item in data.get("items", []):
+            vid = item.get("id", {}).get("videoId")
+            if vid:
+                urls.append(f"https://www.youtube.com/watch?v={vid}")
+
+        logging.info(f"[search] '{query}' page {pages}: {len(urls)} candidates")
+        yield urls
+
+        next_page_token = data.get("nextPageToken")
+        if not next_page_token:
+            break
+
+### ydl options for ydl library. A lot of settings must be set here for our usage case.
+### Preferred formats are MP4 but will will fallback to the next best thing and remux post-process if needed
+### Also some options for us to "sleep" or download videos in fragments
+### webclient is enforced  to help smoothen downloads
+### optional use of cookie files 
+
+def make_ydl_opts(videos_dir: Path, meta_dir: Path) -> dict:
+    cookies_path = os.getenv("COOKIES_FILE")  # optional cookies.txt path
+
+    # Build a proper callable match_filter
+    if ENFORCE_DURATION:
+        expr = f"!is_live & !is_upcoming & duration >= {DURATION_MIN_S} & duration <= {DURATION_MAX_S}"
+    else:
+        expr = "!is_live & !is_upcoming"
+    mf_callable = match_filter_func(expr)  
+
+    opts = {
+        # filtered logger (SABR lines hidden)
+        "logger": YTDLPLogger(),  
+
+        # Prefer progressive single-file MP4 first; fallback to DASH/best
+        "format": "b[ext=mp4]/bv*+ba/b",
+        "merge_output_format": "mp4",
+        "postprocessors": [{"key": "FFmpegVideoRemuxer", "preferedformat": "mp4"}],
+
+        # Clean outputs: videos under videos_dir; sidecars under meta_dir
+        "paths": {"home": str(videos_dir), "temp": str(videos_dir)},
+        "outtmpl": {
+            "default": "%(title).100s [%(id)s].%(ext)s",
+            "infojson": str(meta_dir / "%(id)s.%(ext)s"),
+            "description": str(meta_dir / "%(id)s.%(ext)s"),
+            "thumbnail": str(meta_dir / "%(id)s.%(ext)s"),
+            "subtitle": str(meta_dir / "%(id)s.%(ext)s"),
+        },
+
+        "noplaylist": True,
+        "writeinfojson": True,
+        "writedescription": True,
+        "writethumbnail": True,
+        "writesubtitles": False,
+        "download_archive": str(ARCHIVE_FILE),
+        "ignoreerrors": True,
+        "nooverwrites": True,
+        "match_filter": mf_callable,  
+
+        # Jitters and sleep timers 
+        "retries": 10,
+        "fragment_retries": 10,
+        "extractor_retries": 3,
+        "sleep_interval": 2.0,
+        "max_sleep_interval": 5.0,
+        "sleep_interval_requests": 1.0,
+        "max_sleep_interval_requests": 2.5,
+        "concurrent_fragment_downloads": 1,
+
+        # Enforce web client
+        "geo_bypass": True,
+        "http_headers": {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/125.0.0.0 Safari/537.36"
+            )
+        },
+        "extractor_args": {"youtube": {"player_client": ["web"]}},
+    }
+    if cookies_path and os.path.exists(cookies_path):
+        opts["cookiefile"] = cookies_path
+    return opts
+
+### This is a function to force the script to enforce quotas for genres if any of the urls from
+### search_youtube_cc_stream fails
+def fill_genre_strict(term: str, target: int) -> int:
+    """
+    Strictly fill `target` items for a genre.
+    - Streams pages of candidates until target reached or pages exhausted
+    - De-dups across pages; shuffles within each page
+    - Logs title before downloading; backoff after repeated failures
+    """
+    total = 0
+    seen = set()
+    consec_fail = 0
+    ydl_opts = make_ydl_opts(VIDEOS_DIR, META_DIR)
+
+    with YoutubeDL(ydl_opts) as ydl:
+        for page_urls in search_youtube_cc_stream(API_KEY, term, VIDEO_DURATION_HINT):
+            # De-dup and shuffle to spread load (channels/ages)
+            page_urls = [u for u in page_urls if u not in seen]
+            random.shuffle(page_urls)
+            seen.update(page_urls)
+
+            for url in page_urls:
+                if total >= target:
+                    return total
+
+                # Try to show title before download
+                title = None
+                try:
+                    info = ydl.extract_info(url, download=False)
+                    title = info.get("title")
+                except Exception:
+                    pass
+                disp = f"{title} ({url})" if title else url
+                logging.info(f"[{term}] Downloading: {disp}")
+
+                try:
+                    ret = ydl.download([url])
+                    if ret == 0:
+                        total += 1
+                        consec_fail = 0
+                        logging.info(f"[{term}] OK ({total}/{target}): {disp}")
+                    else:
+                        consec_fail += 1
+                        _append_fail(url, f"return_code={ret}", term)
+                        logging.warning(f"[{term}] yt-dlp nonzero return ({ret}) for: {disp}")
+                except Exception as e:
+                    consec_fail += 1
+                    _append_fail(url, f"exception={e}", term)
+                    logging.error(f"[{term}] Download failed: {disp} | {e}")
+
+                # Backoff after a streak of failures
+                if consec_fail >= BACKOFF_AFTER_FAILS:
+                    logging.info(f"Pausing {BACKOFF_SECONDS}s after repeated failures...")
+                    time.sleep(BACKOFF_SECONDS)
+                    consec_fail = 0
+
+                # Gentle jitter between attempts
+                time.sleep(random.uniform(*JITTER_BETWEEN_ATTEMPTS))
+
+            # Small breather between pages
+            time.sleep(random.uniform(*JITTER_BETWEEN_PAGES))
+
+    # Ran out of pages or hit a search error
+    return total
+
+### Main script for us to use. 
+### Integrates all functions together
+def run_pipeline():
+    if not API_KEY or API_KEY == "YOUR_API_KEY_HERE":
+        logging.error("YOUTUBE_API_KEY is not set in env or code. Aborting.")
+        return
+
+    # Setup folders/files
+    VIDEOS_DIR.mkdir(parents=True, exist_ok=True)
+    META_DIR.mkdir(parents=True, exist_ok=True)
+    ARCHIVE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    if not ARCHIVE_FILE.exists():
+        ARCHIVE_FILE.touch()
+
+    per_genre_quota = max(1, MAX_VIDEOS // len(SEARCH_TERMS))
+    total_target = per_genre_quota * len(SEARCH_TERMS)
+
+    logging.info(
+        f"Pipeline start | batch={BATCH_DIR.name} | target={total_target} | per_genre={per_genre_quota} "
+        f"| duration_gate={'ON' if ENFORCE_DURATION else 'OFF'} [{DURATION_MIN_S}-{DURATION_MAX_S}s] "
+        f"| videos_dir={VIDEOS_DIR} | meta_dir={META_DIR}"
+    )
+
+    total_downloaded = 0
+    per_genre_counts = {}
+
+    for term in SEARCH_TERMS:
+        logging.info(f"--- Genre: {term} | Target: {per_genre_quota} ---")
+        got = fill_genre_strict(term, per_genre_quota)
+        per_genre_counts[term] = got
+        total_downloaded += got
+        logging.info(
+            f"Completed '{term}': {got}/{per_genre_quota} "
+            f"(cumulative={total_downloaded}/{total_target})"
+        )
+
+    logging.info(
+        f"Pipeline finished | batch={BATCH_DIR.name} | total={total_downloaded}/{total_target} "
+        f"| per-genre={per_genre_counts} | videos_dir={VIDEOS_DIR} | meta_dir={META_DIR}"
+    )
+if __name__ == "__main__":
+    run_pipeline()
