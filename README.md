@@ -1,5 +1,5 @@
 # DSRP-A
-A public repository made available as part of the research work done in the penultimate trimester of my postgraduate research: "Building a Data Pipeline for the collection, preprocessing and analysis of Video-Music Pairs"
+A public repository made available as part of the research work done in the penultimate trimester of my postgraduate research: "Building a Data Pipeline for the collection, preprocessing and analysis of Video-Music Pairs". You will need your own Google API key in order to run the script. 
 
 It is important to note that this is a work in progress and as such, the codes available here may not yet be marked down, refactored or optimized. 
 
